@@ -6,18 +6,31 @@
   "original_tree": 树 JSON | null,
   "candidate_tree": 树 JSON | null,
   "draft": 工况草稿 | null,
-  "confirmation": {                 # 已确认的接管方案，null 表示尚无确认
+  "confirmation": {                 # 已确认的接管方案，null 表示尚无/已被换版停用
       "revision": 确认时的草稿版本号,
       "zone": [lo, hi],
       "draft": {…工况…},
       "candidate_tree": {…确认时快照…},
       "trial_id": 试算任务 id,
       "confirmed_at": ISO 时间
+  } | null,
+  "deactivation": {                 # 换版核对停用接管的记录（含原因），null 表示从未停用
+      "deactivated_at": ISO 时间,
+      "reason": 中文停用原因,
+      "zone": 原获准温区,
+      "approved_draft": 原获准工况,
+      "candidate_trial_id": 原试算 id,
+      "disagreement_intervals": 分歧温度区间列表,
+      "sample": 示例分歧读数与两树类别
   } | null
 }
 
 试算任务保存在进程内存中（守护线程异步执行），重启后需重新试算；
 草稿与确认结果落盘，重启不丢。
+
+换版（保存新原树）与确认共用同一把锁并采用“期望 revision”条件写入：
+期间若另一次换原树或确认已经生效，条件写入抛出 ConflictError，
+由上层按最新状态重查或要求工艺员重试。
 """
 
 import json
@@ -27,8 +40,24 @@ import uuid
 from datetime import datetime, timezone
 
 
+class ConflictError(Exception):
+    """条件写入失败：调用方持有的 revision 已过期，需按最新状态重查/重试。"""
+
+
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _default_state():
+    return {
+        "revision": 0,
+        "original_tree": None,
+        "candidate_tree": None,
+        "draft": None,
+        "confirmation": None,
+        # 接管被换版核对停用后的停用记录（含原因），null 表示从未停用。
+        "deactivation": None,
+    }
 
 
 class Store:
@@ -42,24 +71,27 @@ class Store:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with self._lock:
             if not os.path.exists(path):
-                self._write_locked({
-                    "revision": 0,
-                    "original_tree": None,
-                    "candidate_tree": None,
-                    "draft": None,
-                    "confirmation": None,
-                })
+                self._write_locked(_default_state())
 
     # ---------- 底层读写 ----------
     def _read_locked(self):
         with open(self.path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            state = json.load(fh)
+        # 兼容旧版本状态文件：补出换版停用记录字段。
+        if "deactivation" not in state:
+            state["deactivation"] = None
+        return state
 
     def _write_locked(self, state):
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
+
+    def snapshot_state(self):
+        """读取当前完整状态（加锁），供换版核对前取快照。"""
+        with self._lock:
+            return self._read_locked()
 
     def get_state(self):
         with self._lock:
@@ -73,10 +105,43 @@ class Store:
             return self._read_locked()["revision"]
 
     # ---------- 保存 ----------
-    def save_original_tree(self, tree):
+    def save_original_tree(self, tree, expected_revision=None):
+        """保存原树。
+
+        expected_revision 给定时为条件写入：仅当当前 revision 未变化才提交，
+        否则抛 ConflictError；revision 自增与文件替换在同一把锁内完成。
+        候选树与工况草稿（含最新草稿）原样保留，不受换版影响。
+        """
         with self._lock:
             state = self._read_locked()
+            if expected_revision is not None and state["revision"] != expected_revision:
+                raise ConflictError(
+                    f"期望 revision={expected_revision}，当前已为 {state['revision']}"
+                )
             state["original_tree"] = tree
+            state["revision"] += 1
+            self._write_locked(state)
+            return state["revision"]
+
+    def replace_original_tree(self, tree, expected_revision, confirmation_change=None,
+                              deactivation=None):
+        """换版专用条件写入：新原树与（核对后的）接管状态在同一原子事务落盘。
+
+        confirmation_change:
+          None        保留现有 confirmation（核对通过或本无接管方案）；
+          "deactivate" 停用接管（confirmation 置空，写入 deactivation）。
+        草稿与候选树始终原样保留。
+        """
+        with self._lock:
+            state = self._read_locked()
+            if state["revision"] != expected_revision:
+                raise ConflictError(
+                    f"期望 revision={expected_revision}，当前已为 {state['revision']}"
+                )
+            state["original_tree"] = tree
+            if confirmation_change == "deactivate":
+                state["confirmation"] = None
+                state["deactivation"] = deactivation
             state["revision"] += 1
             self._write_locked(state)
             return state["revision"]
@@ -92,9 +157,18 @@ class Store:
             return state["revision"]
 
     def confirm(self, job):
-        """依据一个成功且未过期的试算任务写入确认。"""
+        """依据一个成功且未过期的试算任务写入确认（条件写入，防并发换版）。
+
+        若 revision 已被并发的换原树/草稿保存推进，则抛 ConflictError，
+        由上层返回 409，要求工艺员按最新状态重新试算。
+        新确认生效时清掉历史停用记录。
+        """
         with self._lock:
             state = self._read_locked()
+            if state["revision"] != job["revision"]:
+                raise ConflictError(
+                    f"期望 revision={job['revision']}，当前已为 {state['revision']}"
+                )
             state["confirmation"] = {
                 "revision": job["revision"],
                 "zone": list(job["result"]["zone"]),
@@ -105,6 +179,7 @@ class Store:
                 "trial_id": job["id"],
                 "confirmed_at": _now_iso(),
             }
+            state["deactivation"] = None
             state["revision"] += 1
             self._write_locked(state)
             return state["revision"], state["confirmation"]

@@ -62,7 +62,7 @@ async function loadExamples() {
   });
 }
 
-// ---------- 保存原树 ----------
+// ---------- 保存原树（换版：可能触发接管核对/停用）----------
 $("btn-save-original").onclick = async () => {
   try {
     const tree = parseJsonArea($("original-tree"), "原树");
@@ -70,10 +70,19 @@ $("btn-save-original").onclick = async () => {
       method: "POST",
       body: JSON.stringify({ tree }),
     });
-    showMsg($("original-msg"), `原树已保存（revision=${data.revision}），旧试算均已过期`, true);
+    if (data.takeover === "deactivated") {
+      showMsg($("original-msg"),
+        `新原树已保存（revision=${data.revision}），接管已停用：${data.message}`, false);
+    } else if (data.takeover === "active") {
+      showMsg($("original-msg"),
+        `新原树已保存（revision=${data.revision}），核对通过，接管继续：${data.message}`, true);
+    } else {
+      showMsg($("original-msg"),
+        `新原树已保存（revision=${data.revision}）：${data.message}`, true);
+    }
     await refreshState();
   } catch (err) {
-    showMsg($("original-msg"), err.message, false);
+    showMsg($("original-msg"), "换版未生效：" + err.message, false);
   }
 };
 
@@ -199,13 +208,29 @@ function renderConfirmation(state) {
   const el = $("confirmation");
   const badge = $("confirm-badge");
   const c = state.confirmation;
+  const deactivation = state.deactivation;
   if (!c) {
-    el.className = "confirmation empty";
-    el.textContent = "尚无确认方案，当前所有读数均由原树分流。";
     badge.classList.add("hidden");
+    if (deactivation) {
+      el.className = "confirmation deactivated";
+      const s = deactivation.sample;
+      const sampleText = s
+        ? `\n示例分歧读数：温度=${s.readings.temperature}，前压=${s.readings.front}，后压=${s.readings.back}` +
+          `（新原树判 ${s.original_category}，获准候选树判 ${s.candidate_category}）`
+        : "";
+      el.textContent =
+        `接管已停用（停用时间：${deactivation.deactivated_at}）\n` +
+        `停用原因：${deactivation.reason}` +
+        sampleText +
+        "\n当前全部读数均由新原树分拣；如需重新接管，请保存草稿、重新试算并确认。";
+    } else {
+      el.className = "confirmation empty";
+      el.textContent = "尚无确认方案，当前所有读数均由原树分流。";
+    }
     return;
   }
   badge.classList.remove("hidden");
+  badge.textContent = "已有确认方案";
   el.className = "confirmation";
   const d = c.draft;
   el.textContent =
@@ -215,7 +240,8 @@ function renderConfirmation(state) {
     `后压 [${d.back[0]}, ${d.back[1]}]，` +
     `后压−前压 [${d.diff[0]}, ${d.diff[1]}]\n` +
     `来源试算：${c.trial_id.slice(0, 8)}…（确认时 revision=${c.revision}）\n` +
-    `规则：只有温区内且同时满足上述获准工况的读数使用候选树，其余读数一律使用原树。`;
+    `规则：只有温区内且同时满足上述获准工况的读数使用候选树，其余读数一律使用原树。\n` +
+    `换版说明：保存新原树时会按上述获准温区与工况核对两树；全部合规读数分类一致则接管继续，否则保存新原树并停用接管。`;
 }
 
 // ---------- 读数查询 ----------

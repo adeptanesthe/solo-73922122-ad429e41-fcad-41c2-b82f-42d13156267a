@@ -4,3 +4,4 @@ tests/
 data/
 .git/
 .venv/
+.pydeps/

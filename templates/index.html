@@ -12,6 +12,8 @@
   <p class="subtitle">
     录入原树与候选树（JSON，每棵至多 128 个叶子），保存工况草稿并试算最长安全温区；
     确认后仅温区内且符合获准工况的读数由候选树分流，其余仍走原树。
+    已有接管方案时保存新原树，会按获准温区、前后压与压差核对两树：全部分类一致则接管继续，
+    发现分歧则保存新原树并停用接管（停用原因见下方，重启后仍由新原树分拣）。
   </p>
   <div class="revision-bar">
     <span>当前草稿版本号 revision：<strong id="revision">–</strong></span>
@@ -29,7 +31,7 @@
     <h2>② 原树录入</h2>
     <p class="hint">叶子：<code>{"leaf": "类别"}</code>；分支：
       <code>{"feature":"temperature|front|back","threshold":整数,"left":…,"right":…}</code>，
-      读数 ≤ 阈值走 left，否则走 right。</p>
+      读数 ≤ 阈值走 left，否则走 right。已有生效接管时保存即触发换版核对（不逐组枚举读数，核对期间仍可查询与存草稿）。</p>
     <textarea id="original-tree" rows="10" spellcheck="false"></textarea>
     <div class="row">
       <button id="btn-save-original">保存原树</button>
